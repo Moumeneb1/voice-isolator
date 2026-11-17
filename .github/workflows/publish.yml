@@ -1,0 +1,178 @@
+# Copyright 2026 Inworld AI — Apache-2.0
+# Dispatch on a reviewed v<version> tag after the repository and weights are public.
+name: publish
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-publish
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: >-
+      github.server_url == 'https://github.com' &&
+      github.repository == 'inworld-ai/voice-isolator' &&
+      !github.event.repository.private && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+      - name: Python 3.12
+        # Use a uv-managed interpreter and pip consistently across runners.
+        run: |
+          uv venv --python 3.12 --python-preference only-managed --seed "${RUNNER_TEMP}/py"
+          echo "${RUNNER_TEMP}/py/bin" >> "$GITHUB_PATH"
+      - name: Verify tag, version and model pins
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          test "$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")" = "${RELEASE_SHA}"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor "${RELEASE_SHA}" origin/main
+          python - <<'PY'
+          import ast
+          import os
+          import pathlib
+          import re
+          import runpy
+          import tomllib
+
+          project = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]
+          module = ast.parse(pathlib.Path("src/inworld/voice_isolation/__init__.py").read_text())
+          version = next(ast.literal_eval(node.value) for node in module.body
+                         if isinstance(node, ast.Assign)
+                         and any(isinstance(target, ast.Name) and target.id == "__version__"
+                                 for target in node.targets))
+          assert project["name"] == "inworld-voice-isolation"
+          assert project["version"] == version
+          assert os.environ["RELEASE_TAG"] == "v" + version
+          registry = runpy.run_path("src/inworld/voice_isolation/registry.py")
+          expected = {
+              "MODELS": {"voice-isolator-v1", "voice-isolator-v1-realtime"},
+              "PINNED": {"voice-isolator-v0", "voice-isolator-v0-realtime"},
+          }
+          for group, names in expected.items():
+              assert set(registry[group]) == names, group
+              for name, entry in registry[group].items():
+                  assert re.fullmatch(r"[0-9a-f]{40}", entry["revision"] or ""), (name, "pin the final HF commit")
+                  assert re.fullmatch(r"[0-9a-f]{64}", entry["sha256"] or ""), (name, "missing weight checksum")
+          print("Version tag and immutable model identities verified.")
+          PY
+
+  ci:
+    needs: preflight
+    uses: ./.github/workflows/ci.yml
+    with:
+      release: true
+
+  verify:
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      HF_HUB_DISABLE_IMPLICIT_TOKEN: "1"
+      HF_TOKEN: ""
+      HUGGING_FACE_HUB_TOKEN: ""
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: python-distributions
+          path: dist/
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+      - name: Python 3.12
+        # Use a uv-managed interpreter and pip consistently across runners.
+        run: |
+          uv venv --python 3.12 --python-preference only-managed --seed "${RUNNER_TEMP}/py"
+          echo "${RUNNER_TEMP}/py/bin" >> "$GITHUB_PATH"
+      - name: Install the validated wheel
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends libsndfile1
+          python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install dist/*.whl
+          voice-isolate --help
+      - name: Verify anonymous downloads and both inference modes
+        working-directory: ${{ runner.temp }}
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          HF_HOME: ${{ runner.temp }}/release-hf-home
+        run: |
+          python - <<'PY'
+          import os
+          import huggingface_hub
+          import torch
+          from inworld import voice_isolation
+          from inworld.voice_isolation import registry
+
+          torch.set_num_threads(1)
+          torch.set_num_interop_threads(1)
+          assert os.environ["RELEASE_TAG"] == "v" + voice_isolation.__version__
+          audio = 0.1 * torch.sin(2 * torch.pi * 440 * torch.arange(12000) / voice_isolation.SR)
+          verified = {}
+          for name, entry in {**voice_isolation.MODELS, **registry.PINNED}.items():
+              identity = (entry["repo_id"], entry["filename"], entry["revision"])
+              if identity not in verified:
+                  checkpoint = huggingface_hub.hf_hub_download(
+                      repo_id=entry["repo_id"], filename=entry["filename"],
+                      revision=entry["revision"], token=False, force_download=True)
+                  verified[identity] = registry.sha256_file(checkpoint)
+              assert verified[identity] == entry["sha256"], name
+              print(name, "anonymous pinned model download verified")
+          for mode in registry.MODE_MODELS:
+              isolator = voice_isolation.VoiceIsolator(
+                  "inworld/voice-isolator", mode=mode, device="cpu", lookahead_frames=2 if mode == "streaming" else 0)
+              if mode == "offline":
+                  voice = isolator.isolate(audio, voice_isolation.SR)
+              else:
+                  stream = isolator.stream()
+                  voice = torch.cat([stream.push(piece) for piece in audio.split(960)] + [stream.flush()])
+              assert voice.shape == audio.shape and torch.isfinite(voice).all(), mode
+              print(mode, "anonymous model download and inference passed")
+          PY
+
+  publish:
+    needs: [preflight, ci, verify]
+    if: >-
+      github.server_url == 'https://github.com' &&
+      github.repository == 'inworld-ai/voice-isolator' &&
+      !github.event.repository.private && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/inworld-voice-isolation
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: python-distributions
+          path: dist/
+      - name: Verify the public tag still identifies these artifacts
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          refs=$(git ls-remote --exit-code "https://github.com/${GITHUB_REPOSITORY}.git" \
+            "refs/tags/${RELEASE_TAG}" "refs/tags/${RELEASE_TAG}^{}")
+          commit=$(awk '$2 ~ /\^\{\}$/ {print $1}' <<<"${refs}")
+          if [ -z "${commit}" ]; then
+            commit=$(awk '{print $1}' <<<"${refs}")
+          fi
+          test "${commit}" = "${RELEASE_SHA}"
+      - name: Publish the validated distributions
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1

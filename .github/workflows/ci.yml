@@ -1,0 +1,224 @@
+# Copyright 2026 Inworld AI — Apache-2.0
+#
+# What a newcomer's machine does: a fresh environment, the package installed from the checkout
+# and from a built wheel, the import contract, the command line, and the CPU tests. No weights,
+# no benchmark audio and no GPU are available here, so the two golden-parity tests skip and say so.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+    inputs:
+      release:
+        description: Stage the validated distributions for publication
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+      - name: Python ${{ matrix.python }}
+        # Use a uv-managed interpreter and pip consistently across runners.
+        run: |
+          uv venv --python ${{ matrix.python }} --python-preference only-managed --seed "${RUNNER_TEMP}/py"
+          echo "${RUNNER_TEMP}/py/bin" >> "$GITHUB_PATH"
+      - name: System audio libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsndfile1 ffmpeg
+      - name: CPU PyTorch
+        run: python -m pip install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+      - name: Install from the checkout
+        # the CPU index stays in reach, so a dependency that re-resolves torch gets the CPU build, not the CUDA stack
+        env:
+          PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+        run: python -m pip install --no-cache-dir -e ".[dev,eval,docs,demo]"   # exercise benchmark, figure and demo tests
+      - name: Import contract and command line
+        run: |
+          python - <<'PY'
+          import sys
+          from inworld import voice_isolation
+          heavy = {"demucs", "transformers", "gradio"} & set(sys.modules)
+          assert not heavy, f"importing the package pulled in {heavy}"
+          assert "voice-isolator-v1" in voice_isolation.MODELS
+          print(sorted(voice_isolation.__all__))
+          PY
+          voice-isolate --help
+          voice-isolate-doctor   # the default level uses no network; with no weights cached it still exits 0
+      - name: Tests on CPU
+        run: python -m pytest -q -rs
+
+  wheel:
+    name: distribution contents and installation outside the checkout
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+      - name: Python 3.10
+        # Use a uv-managed interpreter and pip consistently across runners.
+        run: |
+          uv venv --python 3.10 --python-preference only-managed --seed "${RUNNER_TEMP}/py"
+          echo "${RUNNER_TEMP}/py/bin" >> "$GITHUB_PATH"
+      - name: System audio libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsndfile1
+      - name: Build distributions
+        run: |
+          python -m venv --without-pip "${RUNNER_TEMP}/build"
+          python -m pip --isolated --python "${RUNNER_TEMP}/build" install \
+            --require-hashes --only-binary=:all: --index-url https://pypi.org/simple \
+            -r .github/requirements/build.txt
+          sha256sum README.md > "${RUNNER_TEMP}/readme.sha256"
+          "${RUNNER_TEMP}/build/bin/python" -m build --no-isolation
+          sha256sum --check "${RUNNER_TEMP}/readme.sha256"
+          "${RUNNER_TEMP}/build/bin/python" -m twine check --strict dist/*
+      - name: Check archive contents and documentation links
+        run: |
+          python - <<'PY'
+          import email.parser
+          import pathlib
+          import posixpath
+          import re
+          import tarfile
+          import urllib.parse
+          import zipfile
+
+          package = "voice_isolation"
+          readme = pathlib.Path("README.md").read_text(encoding="utf-8")
+          images = re.findall(r'(?:src|srcset)="([^"]*docs/assets/[^"]+)"', readme)
+          assert images and all(path.startswith("docs/assets/") for path in images), (
+              "Repository README images must use relative paths", images)
+          expected_description = re.sub(
+              r'(src|srcset)="docs/assets/',
+              r'\1="https://raw.githubusercontent.com/inworld-ai/voice-isolator/main/docs/assets/',
+              readme)
+          # Hatchling includes the public VCS ignore file as build metadata.
+          allowed = {"src", "pyproject.toml", "README.md", "MODEL_CARD.md",
+                     "LICENSE", "NOTICE", "PKG-INFO", ".gitignore"}
+          (source,) = pathlib.Path("dist").glob("*.tar.gz")
+          with tarfile.open(source) as archive:
+              files = {"/".join(pathlib.PurePosixPath(item.name).parts[1:]): item
+                       for item in archive.getmembers() if item.isfile()}
+              unexpected = {name for name in files
+                            if name.split("/")[0] not in allowed
+                            and name != "docs/USAGE.md"
+                            and not name.startswith("docs/assets/")}
+              assert not unexpected, f"unexpected source archive files: {sorted(unexpected)}"
+              assert f"src/inworld/{package}/__init__.py" in files
+              assert "src/inworld/__init__.py" not in files
+              assert archive.extractfile(files["README.md"]).read().decode("utf-8") == readme
+              assert all(path in files for path in images), "README image missing from sdist"
+              source_description = email.parser.Parser().parsestr(
+                  archive.extractfile(files["PKG-INFO"]).read().decode("utf-8")).get_payload()
+              assert source_description == expected_description, "Unexpected sdist description"
+              # Check Markdown links and HTML image sources in the shipped docs.
+              for name, item in files.items():
+                  if not name.endswith(".md"):
+                      continue
+                  document = archive.extractfile(item).read().decode("utf-8")
+                  links = re.findall(r'\]\(([^)\s]+)\)|(?:src|srcset|href)="([^"]+)"', document)
+                  for markdown, html in links:
+                      link = urllib.parse.urlsplit(markdown or html)
+                      if link.scheme or link.netloc or not link.path:
+                          continue
+                      target = posixpath.normpath(posixpath.join(
+                          posixpath.dirname(name), urllib.parse.unquote(link.path)))
+                      assert (target in files or any(
+                          path.startswith(target + "/") for path in files)), (name, target)
+
+          (wheel,) = pathlib.Path("dist").glob("*.whl")
+          with zipfile.ZipFile(wheel) as archive:
+              names = set(archive.namelist())
+              (metadata_file,) = (name for name in names if name.endswith(".dist-info/METADATA"))
+              description = email.parser.Parser().parsestr(
+                  archive.read(metadata_file).decode("utf-8")).get_payload()
+              assert description == source_description == expected_description, (
+                  "Wheel and sdist descriptions must match the transformed README")
+              links = re.findall(r'\]\(([^)\s]+)\)|(?:src|srcset|href)="([^"]+)"', description)
+              for markdown, html in links:
+                  link = urllib.parse.urlsplit(markdown or html)
+                  assert not link.path or (link.scheme in {"http", "https"} and link.netloc), (markdown, html)
+          metadata = {name.split("/")[0] for name in names
+                      if name.split("/")[0].endswith(".dist-info")}
+          assert len(metadata) == 1, f"unexpected wheel metadata: {metadata}"
+          unexpected = {name for name in names
+                        if name.split("/")[0] not in metadata | {"inworld"}}
+          assert not unexpected, f"unexpected wheel files: {sorted(unexpected)}"
+          assert f"inworld/{package}/__init__.py" in names
+          assert "inworld/__init__.py" not in names
+          print("Source and wheel inventories and documentation links are valid.")
+          PY
+      - name: Install wheel in a fresh environment
+        run: |
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/python -m pip install --upgrade pip  # the venv's bundled pip cannot read current wheel metadata
+          /tmp/fresh/bin/python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+          /tmp/fresh/bin/python -m pip install dist/*.whl
+      - name: Use outside the checkout
+        working-directory: /tmp
+        run: |
+          /tmp/fresh/bin/python - <<'PY'
+          import torch
+          from inworld import voice_isolation
+          y = voice_isolation.resample(torch.zeros(16000), 16000, voice_isolation.SR)
+          assert y.shape == (48000,), y.shape
+          print("inworld-voice-isolation imports and resamples from a wheel")
+          PY
+          /tmp/fresh/bin/voice-isolate --help
+          /tmp/fresh/bin/voice-isolate-doctor
+
+      - name: Stage validated distributions
+        if: inputs.release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  style:
+    name: style and tracked-file hygiene
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78
+      - name: Python 3.10
+        # Use a uv-managed interpreter and pip consistently across runners.
+        run: |
+          uv venv --python 3.10 --python-preference only-managed --seed "${RUNNER_TEMP}/py"
+          echo "${RUNNER_TEMP}/py/bin" >> "$GITHUB_PATH"
+      - name: yapf, isort and pylint (the Google style guide's pylintrc, unmodified)
+        run: |
+          python -m pip install "yapf==0.43.0" "isort==9.0.2" "pylint==4.1.1"
+          make PYTHON=python format-check lint
+      - name: No machine-specific paths in tracked files
+        run: |
+          if git grep -nE '(^|[^[:alnum:]_/.])/(home|inworld|mnt)/' -- . ':!AGENTS.md' ':!.github/workflows/ci.yml'; then
+            echo "machine-specific paths found in tracked files"; exit 1
+          fi
