@@ -52,13 +52,17 @@ def _dot(a, b, ieee: tl.constexpr):
 
 
 @triton.jit
-def _attend_kernel(qkv, keys, values, cos, sin, out, first, start, frames,
+def _attend_kernel(qkv, keys, values, cos, sin, out, first_at, start, frames,
                    window, scale, qkv_row, qkv_frame, qkv_part, qkv_head,
                    cache_row, cache_head, cache_slot, out_row, out_frame,
-                   exclusive: tl.constexpr, ieee: tl.constexpr,
-                   head_dim: tl.constexpr, block_frames: tl.constexpr,
-                   block_keys: tl.constexpr):
+                   first_in_memory: tl.constexpr, exclusive: tl.constexpr,
+                   ieee: tl.constexpr, head_dim: tl.constexpr,
+                   block_frames: tl.constexpr, block_keys: tl.constexpr):
     half: tl.constexpr = head_dim // 2
+    if first_in_memory:
+        first = tl.load(first_at).to(tl.int32)
+    else:
+        first = first_at
     row = tl.program_id(0)
     head = tl.program_id(1)
     frame = tl.arange(0, block_frames)
@@ -154,8 +158,8 @@ def supports(head_dim: int, frames: int) -> bool:
 
 
 def attend(qkv: torch.Tensor, keys: torch.Tensor, values: torch.Tensor,
-           cos: torch.Tensor, sin: torch.Tensor, first: int, start: int,
-           window: int, exclusive: bool, out: torch.Tensor) -> None:
+           cos: torch.Tensor, sin: torch.Tensor, first: int | torch.Tensor,
+           start: int, window: int, exclusive: bool, out: torch.Tensor) -> None:
     """One lane's attention block over its cache.
 
     Args:
@@ -166,7 +170,9 @@ def attend(qkv: torch.Tensor, keys: torch.Tensor, values: torch.Tensor,
         values: The lane's value buffer, like ``keys``.
         cos: Rotary cosines [slots, head_dim / 2] in float32, by slot.
         sin: Rotary sines, like ``cos``.
-        first: The slot of the block's first frame.
+        first: The slot of the block's first frame, or a 0-d integer tensor
+            on the device holding it: the kernel then reads it, so a CUDA
+            graph replays the block at the lane's current length.
         start: The first cached slot the block may see.
         window: The trained attention window in frames, 0 for none.
         exclusive: Whether to remove each output's component along its own
@@ -195,6 +201,7 @@ def attend(qkv: torch.Tensor, keys: torch.Tensor, values: torch.Tensor,
            keys.stride(2),
            out.stride(0),
            out.stride(1),
+           first_in_memory=isinstance(first, torch.Tensor),
            exclusive=exclusive,
            ieee=qkv.dtype == torch.float32,
            head_dim=head_dim,

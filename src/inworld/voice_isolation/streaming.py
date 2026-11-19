@@ -208,6 +208,13 @@ def _attend_lane_fused(fused, state: _AttentionState, cache: _AttentionCache,
     """``_attend_lane`` and the exclusive step as one kernel: writes the
     lane's output [rows, frames, width] into ``out``."""
     frames = qkv.shape[1]
+    if isinstance(state.end, torch.Tensor):
+        # a graphed lane (``cuda_graphs``): fixed buffers that never compact,
+        # its length on the device, read by the kernel and advanced in place
+        fused.attend(qkv, state.keys, state.values, cache.cos, cache.sin,
+                     state.end, 0, cache.window, exclusive, out)
+        state.end += frames
+        return
     if state.end + frames > cache.capacity:
         _compact(state, cache)
     _reserve(state, state.end + frames, cache.capacity, qkv[:, :, 1], qkv[:, :,
