@@ -91,6 +91,8 @@ voice.append(session.flush())                       # the rest, once the source 
 voice_isolation.save_audio("sample_14_streamed.wav", torch.cat(voice), sample_rate)
 ```
 
+On an NVIDIA GPU, `live.stream(cuda_graphs=True)` gives the same output with each block replayed as one CUDA graph, several times faster per push; [examples/stream_on_cuda.py](https://github.com/inworld-ai/voice-isolator/blob/main/examples/stream_on_cuda.py) measures it.
+
 The streaming CLI writes only the isolated voice, after the whole file has gone through:
 
 ```bash
